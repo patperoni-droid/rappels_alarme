@@ -1,14 +1,13 @@
-import 'dart:async';
-import 'dart:ui' show Locale;
+// lib/main.dart
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:android_intent_plus/android_intent.dart';
-import 'package:android_intent_plus/flag.dart' as flags;
+import 'package:shared_preferences/shared_preferences.dart';
 
-// ------------------------------ Notifications (plugin)
+/// ───────── Notifications (pour test instantané uniquement)
 final FlutterLocalNotificationsPlugin _notifs = FlutterLocalNotificationsPlugin();
-
 const AndroidNotificationDetails _androidChannel = AndroidNotificationDetails(
   'rappels_channel_id',
   'Notifications des rappels',
@@ -19,134 +18,134 @@ const AndroidNotificationDetails _androidChannel = AndroidNotificationDetails(
 );
 const NotificationDetails _details = NotificationDetails(android: _androidChannel);
 
-// ------------------------------ Générateur d'IDs uniques
-int _seq = DateTime.now().millisecondsSinceEpoch & 0x7fffffff;
-int _newId() {
-  _seq = (_seq + 1) & 0x7fffffff;
-  if (_seq == 0) _seq = 1; // évite 0
-  return _seq;
+/// ───────── Canal natif (Pro = AlarmManager côté Kotlin)
+const MethodChannel _channel = MethodChannel('rappels/alarm');
+
+/// ───────── Modèle + persistance
+class Reminder {
+  final int id;
+  final String title;
+  final String body;
+  final int whenMs; // epoch millis
+
+  Reminder({required this.id, required this.title, required this.body, required this.whenMs});
+  DateTime get when => DateTime.fromMillisecondsSinceEpoch(whenMs);
+
+  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'body': body, 'whenMs': whenMs};
+  static Reminder fromJson(Map<String, dynamic> m) => Reminder(
+    id: m['id'] as int,
+    title: m['title'] as String,
+    body: m['body'] as String,
+    whenMs: m['whenMs'] as int,
+  );
 }
 
-// ------------------------------ Timers internes (fonctionnent comme "Test interne")
-final Map<int, Timer> _timers = {}; // id -> Timer
+class ReminderStore {
+  static const _key = 'reminders_v2';
+  List<Reminder> _items = [];
 
-Future<void> scheduleInternal(
-    Duration delta, {
-      String title = 'Rappel',
-      String body = 'C’est l’heure !',
+  List<Reminder> get items =>
+      List.unmodifiable(_items..sort((a, b) => a.whenMs.compareTo(b.whenMs)));
+
+  Future<void> load() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getStringList(_key) ?? [];
+    _items = raw.map((s) => Reminder.fromJson(jsonDecode(s))).toList();
+  }
+
+  Future<void> add(Reminder r) async {
+    _items.add(r);
+    await _save();
+  }
+
+  Future<void> addAll(Iterable<Reminder> list) async {
+    _items.addAll(list);
+    await _save();
+  }
+
+  Future<void> removeById(int id) async {
+    _items.removeWhere((e) => e.id == id);
+    await _save();
+  }
+
+  Future<void> clear() async {
+    _items.clear();
+    await _save();
+  }
+
+  Future<void> _save() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setStringList(_key, _items.map((e) => jsonEncode(e.toJson())).toList());
+  }
+}
+
+final store = ReminderStore();
+
+/// ───────── Utils
+int _newId() => DateTime.now().microsecondsSinceEpoch & 0x7fffffff;
+String fmt(DateTime dt) {
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${two(dt.day)}/${two(dt.month)}/${dt.year} ${two(dt.hour)}:${two(dt.minute)}';
+}
+
+/// Boîte de dialogue pour demander le nom du rappel
+Future<String?> promptReminderName(
+    BuildContext context, {
+      String title = 'Nom du rappel',
+      String label = 'Nom',
+      String? initial,
     }) async {
-  final id = _newId();
-  final t = Timer(delta, () async {
-    await _notifs.show(id, title, body, _details, payload: 'internal');
-    _timers.remove(id);
-  });
-  _timers[id] = t;
-}
-
-Future<void> cancelAllInternal() async {
-  for (final t in _timers.values) {
-    t.cancel();
-  }
-  _timers.clear();
-}
-
-int pendingInternalCount() => _timers.length;
-
-// ------------------------------ Alarme / Timer via app Horloge (en option)
-Future<void> setAlarmClock({
-  required DateTime when,
-  String message = 'Rappel',
-}) async {
-  final now = DateTime.now();
-  var target = when;
-  if (target.isBefore(now)) target = target.add(const Duration(days: 1));
-
-  final intent = AndroidIntent(
-    action: 'android.intent.action.SET_ALARM',
-    arguments: <String, dynamic>{
-      'android.intent.extra.alarm.MESSAGE': message,
-      'android.intent.extra.alarm.HOUR': target.hour,
-      'android.intent.extra.alarm.MINUTES': target.minute,
-      'android.intent.extra.alarm.SKIP_UI': false,
-    },
+  final ctrl = TextEditingController(text: initial ?? '');
+  return showDialog<String>(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text(title),
+      content: TextField(
+        controller: ctrl,
+        autofocus: true,
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: 'Ex: arrêter la piscine',
+          border: const OutlineInputBorder(),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Annuler')),
+        FilledButton(
+          onPressed: () {
+            final txt = ctrl.text.trim();
+            if (txt.isEmpty) return;
+            Navigator.pop(context, txt);
+          },
+          child: const Text('OK'),
+        ),
+      ],
+    ),
   );
-  try {
-    await intent.launch();
-  } catch (e) {
-    debugPrint('SET_ALARM failed: $e');
-  }
 }
 
-Future<void> scheduleTimer({
-  required int seconds,
-  String message = 'Rappel',
-}) async {
-  final intent = AndroidIntent(
-    action: 'android.intent.action.SET_TIMER',
-    arguments: <String, dynamic>{
-      'android.intent.extra.alarm.LENGTH': seconds,
-      'android.intent.extra.alarm.MESSAGE': message,
-      'android.intent.extra.alarm.SKIP_UI': false,
-    },
-  );
-  try {
-    await intent.launch();
-  } catch (e) {
-    debugPrint('SET_TIMER failed: $e');
-  }
-}
-
-Future<void> openExactAlarmsSettings() async {
-  const intent = AndroidIntent(
-    action: 'android.settings.REQUEST_SCHEDULE_EXACT_ALARM',
-    flags: <int>[flags.Flag.FLAG_ACTIVITY_NEW_TASK],
-  );
-  try {
-    await intent.launch();
-  } catch (e) {
-    debugPrint('Cannot open exact alarm settings: $e');
-  }
-}
-
-// ------------------------------ Callbacks notifs
-@pragma('vm:entry-point')
-void notificationTapBackground(NotificationResponse resp) {
-  debugPrint('BG TAP payload=${resp.payload}');
-}
-
-Future<void> _initNotifications() async {
-  const initAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
-  await _notifs.initialize(
-    const InitializationSettings(android: initAndroid),
-    onDidReceiveNotificationResponse: (resp) {
-      debugPrint('TAP notification payload=${resp.payload}');
-    },
-    onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
-  );
-  final android = _notifs.resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
-  final granted = await android?.areNotificationsEnabled() ?? false;
-  debugPrint('Notifications enabled (Android): $granted');
-}
-
-// ------------------------------ MAIN
+/// ───────── MAIN
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await _initNotifications();
+
+  // Notifs (test instantané)
+  const initAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
+  await _notifs.initialize(const InitializationSettings(android: initAndroid));
+
+  // Persistance
+  await store.load();
+
   runApp(const MyApp());
 }
 
-// ------------------------------ APP
+/// ───────── APP
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Rappels simples',
-      theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        useMaterial3: true,
-      ),
+      title: 'Rappels famille',
+      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       locale: const Locale('fr'),
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
@@ -166,178 +165,508 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ensureAndroidPermissions(context);
-    });
+  Future<void> _requestNotifPerm() async {
+    final android = _notifs
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    try { await android?.requestNotificationsPermission(); } catch (_) {}
   }
 
   @override
-  void dispose() {
-    cancelAllInternal();
-    super.dispose();
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _requestNotifPerm());
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Rappels simples')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: ListView(
-          children: [
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.notifications_active),
-                title: const Text('Test immédiat'),
-                subtitle: const Text('Affiche une notification maintenant'),
-                onTap: () async {
-                  await _notifs.show(
-                    _newId(),
-                    'Test immédiat',
-                    'Ça fonctionne ✅',
-                    _details,
-                  );
-                },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.timer_10),
-                title: const Text('Programmer +10 secondes'),
-                subtitle: const Text('Méthode interne (fiable)'),
-                onTap: () async {
-                  await scheduleInternal(
-                    const Duration(seconds: 10),
-                    title: 'Rappel (10 s)',
-                    body: 'Test 10 secondes',
-                  );
-                  _snack('Planifié dans 10 secondes (interne)');
-                  setState(() {});
-                },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.timer),
-                title: const Text('Programmer +1 minute'),
-                subtitle: const Text('Méthode interne (fiable)'),
-                onTap: () async {
-                  await scheduleInternal(
-                    const Duration(minutes: 1),
-                    title: 'Rappel (+1 min)',
-                    body: 'Test +1 minute',
-                  );
-                  _snack('Planifié dans 1 minute (interne)');
-                  setState(() {});
-                },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.calendar_today),
-                title: const Text('Programmer (date & heure)'),
-                subtitle: const Text('Méthode interne (fiable)'),
-                onTap: () async {
-                  final dt = await _pickDateTime(context);
-                  if (dt == null) return;
-                  final now = DateTime.now();
-                  if (dt.isBefore(now)) {
-                    _snack('La date choisie est passée');
-                    return;
-                  }
-                  final delta = dt.difference(now);
-                  await scheduleInternal(
-                    delta,
-                    title: 'Rappel programmé',
-                    body: 'Le ${_fmt(dt)}',
-                  );
-                  _snack('Planifié pour ${_fmt(dt)} (interne)');
-                  setState(() {});
-                },
-              ),
-            ),
-            const SizedBox(height: 12),
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.info_outline),
-                title: const Text('Statut / Timers internes'),
-                subtitle: Text('En attente : ${pendingInternalCount()}'),
-                onTap: () async {
-                  final android = _notifs.resolvePlatformSpecificImplementation<
-                      AndroidFlutterLocalNotificationsPlugin>();
-                  final granted = await android?.areNotificationsEnabled() ?? false;
-                  _snack('Notifications autorisées=$granted • Timers=${pendingInternalCount()}');
-                },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.clear_all),
-                title: const Text('Vider les rappels internes'),
-                subtitle: const Text('Annule tous les timers internes'),
-                onTap: () async {
-                  await cancelAllInternal();
-                  _snack('Rappels internes annulés');
-                  setState(() {});
-                },
-              ),
+    final media = MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true);
+
+    return MediaQuery(
+      data: media,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Rappels famille'),
+          actions: [
+            IconButton(
+              tooltip: 'Mes rappels',
+              icon: const Icon(Icons.receipt_long),
+              onPressed: () async {
+                await Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const RemindersPage()),
+                );
+                setState(() {}); // refresh au retour
+              },
             ),
           ],
+        ),
+        body: Padding(
+          padding: const EdgeInsets.all(16),
+          child: ListView(
+            children: [
+              // Deux gros boutons
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.alarm),
+                  title: const Text('Rappels du jour'),
+                  subtitle: const Text('Ex: arrêter la piscine dans 2 h, appeler Maman dans 3 h…'),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const DayRemindersPage()),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.event),
+                  title: const Text('Rappels longs (RDV)'),
+                  subtitle: const Text('J-2, J-1, −1h30 + Jour J'),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const LongRemindersPage()),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 24),
+              const Text('Tests (pendant le développement)',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.notification_important),
+                  title: const Text('Test instantané'),
+                  onTap: () async {
+                    await _notifs.show(0, 'Test immédiat', 'Ça fonctionne ✅', _details);
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.timer_10),
+                  title: const Text('Rappel +10 secondes'),
+                  onTap: () async {
+                    final when = DateTime.now().add(const Duration(seconds: 10));
+                    await _schedulePro(when, title: 'Rappel (10 s)', body: 'Test 10 secondes');
+                    _snack(context, 'Planifié pour ${fmt(when)}');
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
+  Future<void> _schedulePro(DateTime when,
+      {required String title, required String body}) async {
+    final id = _newId();
+    final whenMs = when.millisecondsSinceEpoch;
+
+    await _channel.invokeMethod('schedule', {
+      'whenMs': whenMs,
+      'id': id,
+      'title': title,
+      'body': body,
+    });
+
+    await store.add(Reminder(id: id, title: title, body: body, whenMs: whenMs));
+    setState(() {});
+  }
+
+  void _snack(BuildContext ctx, String msg) {
+    ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(content: Text(msg)));
+  }
+}
+
+/// ───────── Page : Rappels du jour (rapides, avec saisie du nom)
+class DayRemindersPage extends StatefulWidget {
+  const DayRemindersPage({super.key});
+  @override
+  State<DayRemindersPage> createState() => _DayRemindersPageState();
+}
+
+class _DayRemindersPageState extends State<DayRemindersPage> {
+  final _titleCtrl = TextEditingController(text: '');
+  final _hoursCtrl = TextEditingController(text: '');
+  final _minsCtrl = TextEditingController(text: '');
+
+  @override
+  void dispose() {
+    _titleCtrl.dispose();
+    _hoursCtrl.dispose();
+    _minsCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _quick(Duration d) async {
+    final fallback = _titleCtrl.text.trim().isEmpty ? 'Rappel' : _titleCtrl.text.trim();
+    final name = await promptReminderName(
+      context,
+      title: 'Nom du rappel du jour',
+      initial: fallback,
+    );
+    if (name == null) return;
+
+    final when = DateTime.now().add(d);
+    await _schedulePro(when, title: name, body: 'Prévu à ${fmt(when)}');
+    _snack('Planifié dans ${_fmtDur(d)}');
+  }
+
+  Future<void> _custom() async {
+    final h = int.tryParse(_hoursCtrl.text.trim()) ?? 0;
+    final m = int.tryParse(_minsCtrl.text.trim()) ?? 0;
+    if (h == 0 && m == 0) {
+      _snack('Renseigne heures et/ou minutes');
+      return;
+    }
+    await _quick(Duration(hours: h, minutes: m));
+  }
+
+  String _fmtDur(Duration d) {
+    if (d.inMinutes < 60) return '${d.inMinutes} min';
+    final h = d.inHours;
+    final m = d.inMinutes % 60;
+    return m == 0 ? '${h} h' : '${h} h ${m} min';
+  }
+
   void _snack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _schedulePro(DateTime when,
+      {required String title, required String body}) async {
+    final id = _newId();
+    final whenMs = when.millisecondsSinceEpoch;
+
+    await _channel.invokeMethod('schedule', {
+      'whenMs': whenMs,
+      'id': id,
+      'title': title,
+      'body': body,
+    });
+    await store.add(Reminder(id: id, title: title, body: body, whenMs: whenMs));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final presets = <(String, Duration)>[
+      ('30 min', const Duration(minutes: 30)),
+      ('1 h', const Duration(hours: 1)),
+      ('2 h', const Duration(hours: 2)),
+      ('3 h', const Duration(hours: 3)),
+      ('4 h', const Duration(hours: 4)),
+      ('6 h', const Duration(hours: 6)),
+    ];
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Rappels du jour'),
+        actions: [
+          IconButton(
+            tooltip: 'Mes rappels',
+            icon: const Icon(Icons.receipt_long),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const RemindersPage()),
+            ),
+          )
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(
+            controller: _titleCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Que veux-tu te rappeler ? (ex: arrêter la piscine)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text('Raccourcis rapides :'),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: presets
+                .map((p) => ActionChip(label: Text(p.$1), onPressed: () => _quick(p.$2)))
+                .toList(),
+          ),
+          const SizedBox(height: 16),
+          const Text('Personnalisé :'),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _hoursCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Heures',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _minsCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Minutes',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            icon: const Icon(Icons.alarm_add),
+            label: const Text('Programmer'),
+            onPressed: _custom,
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'Les notifications restent à l’écran jusqu’à ce que tu les enlèves.',
+            style: TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+        ],
+      ),
     );
   }
 }
 
-// ------------------------------ Permissions Android 13+
-Future<void> ensureAndroidPermissions(BuildContext context) async {
-  final android = _notifs.resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
-  try {
-    await android?.requestNotificationsPermission();
-  } catch (_) {}
+/// ───────── Page : RDV longs (multi-alertes, avec saisie du nom)
+class LongRemindersPage extends StatefulWidget {
+  const LongRemindersPage({super.key});
+  @override
+  State<LongRemindersPage> createState() => _LongRemindersPageState();
 }
 
-// ------------------------------ Sélecteur Date & Heure
-Future<DateTime?> _pickDateTime(BuildContext context) async {
-  final now = DateTime.now();
-  final date = await showDatePicker(
-    context: context,
-    initialDate: now.add(const Duration(minutes: 5)),
-    firstDate: now,
-    lastDate: now.add(const Duration(days: 365)),
-  );
-  if (date == null) return null;
+class _LongRemindersPageState extends State<LongRemindersPage> {
+  final _titleCtrl = TextEditingController();
+  DateTime? _rdv;
+  bool _j2 = true;
+  bool _j1 = true;
+  bool _h90 = true;
 
-  final time = await showTimePicker(
-    context: context,
-    initialTime: TimeOfDay.fromDateTime(now.add(const Duration(minutes: 5))),
-  );
-  if (time == null) return null;
+  @override
+  void dispose() {
+    _titleCtrl.dispose();
+    super.dispose();
+  }
 
-  return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  Future<DateTime?> _pickDateTime(BuildContext context) async {
+    final now = DateTime.now();
+    final date = await showDatePicker(
+      context: context,
+      initialDate: now.add(const Duration(days: 1)),
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 365 * 2)),
+      helpText: 'Date du rendez-vous',
+    );
+    if (date == null) return null;
+
+    final time = await showTimePicker(
+      context: context,
+      initialTime: const TimeOfDay(hour: 10, minute: 0),
+      initialEntryMode: TimePickerEntryMode.input,
+      builder: (ctx, child) => MediaQuery(
+        data: MediaQuery.of(ctx!).copyWith(alwaysUse24HourFormat: true),
+        child: child!,
+      ),
+      helpText: 'Heure du rendez-vous',
+    );
+    if (time == null) return null;
+
+    return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  }
+
+  Future<void> _programmer() async {
+    final typed = _titleCtrl.text.trim();
+    final name = await promptReminderName(
+      context,
+      title: 'Nom du rendez-vous',
+      initial: typed.isEmpty ? 'Rendez-vous' : typed,
+    );
+    if (name == null) return;
+
+    if (_rdv == null) { _snack('Choisis la date & l’heure du rendez-vous'); return; }
+    final rdv = _rdv!;
+    final now = DateTime.now();
+    if (rdv.isBefore(now)) { _snack('La date choisie est passée'); return; }
+
+    int count = 0;
+    final toAdd = <Reminder>[];
+
+    Future<void> _add(DateTime when, String t, String b) async {
+      final id = _newId();
+      final whenMs = when.millisecondsSinceEpoch;
+      await _channel.invokeMethod('schedule', {
+        'whenMs': whenMs,
+        'id': id,
+        'title': t,
+        'body': b,
+      });
+      toAdd.add(Reminder(id: id, title: t, body: b, whenMs: whenMs));
+      count++;
+    }
+
+    if (_j2) {
+      final t = rdv.subtract(const Duration(days: 2));
+      if (t.isAfter(now)) await _add(t, 'J-2 : $name', 'Dans 2 jours — ${fmt(rdv)}');
+    }
+    if (_j1) {
+      final t = rdv.subtract(const Duration(days: 1));
+      if (t.isAfter(now)) await _add(t, 'J-1 : $name', 'Demain — ${fmt(rdv)}');
+    }
+    if (_h90) {
+      final t = rdv.subtract(const Duration(minutes: 90));
+      if (t.isAfter(now)) await _add(t, '−1h30 : $name', 'Dans 1h30 — ${fmt(rdv)}');
+    }
+    await _add(rdv, name, 'C’est l’heure — ${fmt(rdv)}');
+
+    await store.addAll(toAdd);
+    if (mounted) {
+      _snack('$count alarme(s) programmée(s)');
+      Navigator.pop(context);
+    }
+  }
+
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rdvText = _rdv == null ? '—' : fmt(_rdv!);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Rendez-vous longs')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(
+            controller: _titleCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Titre du rendez-vous (ex: Dentiste)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          ListTile(
+            leading: const Icon(Icons.calendar_today),
+            title: const Text('Date & heure du rendez-vous'),
+            subtitle: Text(rdvText),
+            onTap: () async {
+              final dt = await _pickDateTime(context);
+              if (dt != null) setState(() => _rdv = dt);
+            },
+          ),
+          const Divider(),
+          const Text('Pré-alertes'),
+          CheckboxListTile(
+            value: _j2, onChanged: (v) => setState(() => _j2 = v ?? true),
+            title: const Text('J-2 (2 jours avant)'),
+          ),
+          CheckboxListTile(
+            value: _j1, onChanged: (v) => setState(() => _j1 = v ?? true),
+            title: const Text('J-1 (la veille)'),
+          ),
+          CheckboxListTile(
+            value: _h90, onChanged: (v) => setState(() => _h90 = v ?? true),
+            title: const Text('−1h30 (1 h 30 avant)'),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            icon: const Icon(Icons.done),
+            label: const Text('Programmer'),
+            onPressed: _programmer,
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-// ------------------------------ Format FR simple
-String _fmt(DateTime dt) {
-  final dd = dt.day.toString().padLeft(2, '0');
-  final mm = dt.month.toString().padLeft(2, '0');
-  final yyyy = dt.year.toString();
-  final hh = dt.hour.toString().padLeft(2, '0');
-  final min = dt.minute.toString().padLeft(2, '0');
-  return '$dd/$mm/$yyyy $hh:$min';
+/// ───────── Page : Mes rappels (liste + annulation)
+class RemindersPage extends StatefulWidget {
+  const RemindersPage({super.key});
+  @override
+  State<RemindersPage> createState() => _RemindersPageState();
+}
+
+class _RemindersPageState extends State<RemindersPage> {
+  Future<void> _cancel(Reminder r) async {
+    try { await _channel.invokeMethod('cancel', {'id': r.id}); } catch (_) {}
+    await store.removeById(r.id);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Rappel annulé')));
+      setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = store.items;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Mes rappels'),
+        actions: [
+          if (items.isNotEmpty)
+            IconButton(
+              tooltip: 'Tout effacer (liste locale)',
+              icon: const Icon(Icons.delete_sweep),
+              onPressed: () async {
+                final ok = await showDialog<bool>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text('Tout supprimer ?'),
+                    content: const Text(
+                      'Cela efface la liste locale. Les alarmes déjà données au système '
+                          'peuvent encore se déclencher selon Android.',
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annuler')),
+                      FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Supprimer')),
+                    ],
+                  ),
+                );
+                if (ok == true) {
+                  await store.clear();
+                  if (mounted) setState(() {});
+                }
+              },
+            ),
+        ],
+      ),
+      body: items.isEmpty
+          ? const Center(child: Text('Aucun rappel enregistré.'))
+          : ListView.separated(
+        padding: const EdgeInsets.all(16),
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemBuilder: (_, i) {
+          final r = items[i];
+          final past = r.when.isBefore(DateTime.now());
+          return Card(
+            child: ListTile(
+              leading: Icon(past ? Icons.history : Icons.schedule),
+              title: Text(r.title),
+              subtitle: Text('${r.body}\n${fmt(r.when)}'),
+              isThreeLine: true,
+              trailing: IconButton(
+                icon: const Icon(Icons.cancel),
+                tooltip: 'Annuler',
+                onPressed: () => _cancel(r),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
 }
