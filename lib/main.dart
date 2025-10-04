@@ -312,6 +312,8 @@ class _DayRemindersPageState extends State<DayRemindersPage> {
     final when = DateTime.now().add(d);
     await _schedulePro(when, title: name, body: 'Prévu à ${fmt(when)}');
     _snack('Planifié dans ${_fmtDur(d)}');
+
+    if (mounted) Navigator.pop(context); // ⟵ retourne à l’écran d’accueil
   }
 
   Future<void> _custom() async {
@@ -321,7 +323,7 @@ class _DayRemindersPageState extends State<DayRemindersPage> {
       _snack('Renseigne heures et/ou minutes');
       return;
     }
-    await _quick(Duration(hours: h, minutes: m));
+    await _quick(Duration(hours: h, minutes: m)); // _quick fera le pop()
   }
 
   String _fmtDur(Duration d) {

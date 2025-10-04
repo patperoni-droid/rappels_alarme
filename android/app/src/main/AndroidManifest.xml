@@ -2,12 +2,12 @@
     package="com.example.rappels_simple">
 
     <!-- Permissions -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Android 12+ : nécessaire pour les alarmes exactes -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <application
 
+    <application
         android:label="rappels_simple"
         android:icon="@mipmap/ic_launcher">
 
@@ -26,7 +26,19 @@
             </intent-filter>
         </activity>
 
-        <!-- Receiver qui affichera la notification, même si l’app est fermée -->
+        <!-- Activité qui s’affiche quand une alarme sonne -->
+        <activity
+            android:name=".AlarmActivity"
+            android:exported="true"
+            android:theme="@style/AlarmTheme"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleInstance"
+            android:screenOrientation="portrait" />
+
+        <!-- Receiver pour déclencher l’affichage même si l’app est fermée -->
         <receiver
             android:name=".AlarmReceiver"
             android:exported="true" />
@@ -35,7 +47,6 @@
         <meta-data
             android:name="io.flutter.embedding.android.NormalTheme"
             android:resource="@style/NormalTheme"/>
-        <!-- Embedding Flutter v2 -->
         <meta-data
             android:name="flutterEmbedding"
             android:value="2"/>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="alarm_title_placeholder">Titre du rappel</string>
+    <string name="alarm_body_placeholder">C’est l’heure !</string>
+    <string name="alarm_dismiss">J’ai vu</string>
+</resources>
