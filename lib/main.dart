@@ -28,10 +28,22 @@ class Reminder {
   final String body;
   final int whenMs; // epoch millis
 
-  Reminder({required this.id, required this.title, required this.body, required this.whenMs});
+  Reminder({
+    required this.id,
+    required this.title,
+    required this.body,
+    required this.whenMs,
+  });
+
   DateTime get when => DateTime.fromMillisecondsSinceEpoch(whenMs);
 
-  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'body': body, 'whenMs': whenMs};
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'body': body,
+    'whenMs': whenMs,
+  };
+
   static Reminder fromJson(Map<String, dynamic> m) => Reminder(
     id: m['id'] as int,
     title: m['title'] as String,
@@ -73,9 +85,22 @@ class ReminderStore {
     await _save();
   }
 
+  /// Supprime les rappels passés (avec une petite marge `grace`)
+  Future<int> prunePast({Duration grace = const Duration(minutes: 1)}) async {
+    final before = DateTime.now().subtract(grace).millisecondsSinceEpoch;
+    final n0 = _items.length;
+    _items.removeWhere((e) => e.whenMs <= before);
+    final n1 = _items.length;
+    if (n1 != n0) await _save();
+    return n0 - n1;
+  }
+
   Future<void> _save() async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setStringList(_key, _items.map((e) => jsonEncode(e.toJson())).toList());
+    await sp.setStringList(
+      _key,
+      _items.map((e) => jsonEncode(e.toJson())).toList(),
+    );
   }
 }
 
@@ -83,6 +108,7 @@ final store = ReminderStore();
 
 /// ───────── Utils
 int _newId() => DateTime.now().microsecondsSinceEpoch & 0x7fffffff;
+
 String fmt(DateTime dt) {
   String two(int v) => v.toString().padLeft(2, '0');
   return '${two(dt.day)}/${two(dt.month)}/${dt.year} ${two(dt.hour)}:${two(dt.minute)}';
@@ -134,6 +160,8 @@ Future<void> main() async {
 
   // Persistance
   await store.load();
+  // Nettoyage au démarrage
+  await store.prunePast();
 
   runApp(const MyApp());
 }
@@ -145,7 +173,38 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Rappels famille',
-      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: Colors.lightBlue,
+        brightness: Brightness.light,
+        scaffoldBackgroundColor: const Color(0xFFF7FAFF),
+
+        // ⟵ ICI: CardThemeData (nouveau type)
+        cardTheme: const CardThemeData(
+          elevation: 1,
+          margin: EdgeInsets.symmetric(vertical: 6, horizontal: 0),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(16)),
+          ),
+        ),
+
+        appBarTheme: const AppBarTheme(centerTitle: true, elevation: 0),
+        listTileTheme: const ListTileThemeData(iconColor: Colors.lightBlue),
+        snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating),
+        inputDecorationTheme: const InputDecorationTheme(
+          border: OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(14))),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          ),
+        ),
+        chipTheme: const ChipThemeData(
+          side: BorderSide(color: Colors.transparent),
+          labelPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        ),
+      ),
       locale: const Locale('fr'),
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
@@ -166,15 +225,21 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   Future<void> _requestNotifPerm() async {
-    final android = _notifs
-        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-    try { await android?.requestNotificationsPermission(); } catch (_) {}
+    final android =
+    _notifs.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    try {
+      await android?.requestNotificationsPermission();
+    } catch (_) {}
   }
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _requestNotifPerm());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _requestNotifPerm();
+      final removed = await store.prunePast();
+      if (removed > 0 && mounted) setState(() {});
+    });
   }
 
   @override
@@ -191,10 +256,10 @@ class _HomePageState extends State<HomePage> {
               tooltip: 'Mes rappels',
               icon: const Icon(Icons.receipt_long),
               onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const RemindersPage()),
-                );
-                setState(() {}); // refresh au retour
+                await Navigator.of(context)
+                    .push(MaterialPageRoute(builder: (_) => const RemindersPage()));
+                final removed = await store.prunePast();
+                if (removed > 0 && mounted) setState(() {});
               },
             ),
           ],
@@ -203,6 +268,13 @@ class _HomePageState extends State<HomePage> {
           padding: const EdgeInsets.all(16),
           child: ListView(
             children: [
+              const Padding(
+                padding: EdgeInsets.only(bottom: 12, left: 4),
+                child: Text(
+                  'Que veux-tu planifier ?',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+                ),
+              ),
               // Deux gros boutons
               Card(
                 child: ListTile(
@@ -259,8 +331,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Future<void> _schedulePro(DateTime when,
-      {required String title, required String body}) async {
+  Future<void> _schedulePro(DateTime when, {required String title, required String body}) async {
     final id = _newId();
     final whenMs = when.millisecondsSinceEpoch;
 
@@ -313,7 +384,7 @@ class _DayRemindersPageState extends State<DayRemindersPage> {
     await _schedulePro(when, title: name, body: 'Prévu à ${fmt(when)}');
     _snack('Planifié dans ${_fmtDur(d)}');
 
-    if (mounted) Navigator.pop(context); // ⟵ retourne à l’écran d’accueil
+    if (mounted) Navigator.pop(context); // retour accueil
   }
 
   Future<void> _custom() async {
@@ -337,8 +408,7 @@ class _DayRemindersPageState extends State<DayRemindersPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  Future<void> _schedulePro(DateTime when,
-      {required String title, required String body}) async {
+  Future<void> _schedulePro(DateTime when, {required String title, required String body}) async {
     final id = _newId();
     final whenMs = when.millisecondsSinceEpoch;
 
@@ -497,10 +567,16 @@ class _LongRemindersPageState extends State<LongRemindersPage> {
     );
     if (name == null) return;
 
-    if (_rdv == null) { _snack('Choisis la date & l’heure du rendez-vous'); return; }
+    if (_rdv == null) {
+      _snack('Choisis la date & l’heure du rendez-vous');
+      return;
+    }
     final rdv = _rdv!;
     final now = DateTime.now();
-    if (rdv.isBefore(now)) { _snack('La date choisie est passée'); return; }
+    if (rdv.isBefore(now)) {
+      _snack('La date choisie est passée');
+      return;
+    }
 
     int count = 0;
     final toAdd = <Reminder>[];
@@ -535,7 +611,7 @@ class _LongRemindersPageState extends State<LongRemindersPage> {
     await store.addAll(toAdd);
     if (mounted) {
       _snack('$count alarme(s) programmée(s)');
-      Navigator.pop(context);
+      Navigator.pop(context); // retour accueil
     }
   }
 
@@ -571,15 +647,18 @@ class _LongRemindersPageState extends State<LongRemindersPage> {
           const Divider(),
           const Text('Pré-alertes'),
           CheckboxListTile(
-            value: _j2, onChanged: (v) => setState(() => _j2 = v ?? true),
+            value: _j2,
+            onChanged: (v) => setState(() => _j2 = v ?? true),
             title: const Text('J-2 (2 jours avant)'),
           ),
           CheckboxListTile(
-            value: _j1, onChanged: (v) => setState(() => _j1 = v ?? true),
+            value: _j1,
+            onChanged: (v) => setState(() => _j1 = v ?? true),
             title: const Text('J-1 (la veille)'),
           ),
           CheckboxListTile(
-            value: _h90, onChanged: (v) => setState(() => _h90 = v ?? true),
+            value: _h90,
+            onChanged: (v) => setState(() => _h90 = v ?? true),
             title: const Text('−1h30 (1 h 30 avant)'),
           ),
           const SizedBox(height: 12),
@@ -602,11 +681,24 @@ class RemindersPage extends StatefulWidget {
 }
 
 class _RemindersPageState extends State<RemindersPage> {
+  @override
+  void initState() {
+    super.initState();
+    // Nettoie les rappels expirés à l’ouverture de la page
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final removed = await store.prunePast();
+      if (removed > 0 && mounted) setState(() {});
+    });
+  }
+
   Future<void> _cancel(Reminder r) async {
-    try { await _channel.invokeMethod('cancel', {'id': r.id}); } catch (_) {}
+    try {
+      await _channel.invokeMethod('cancel', {'id': r.id});
+    } catch (_) {}
     await store.removeById(r.id);
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Rappel annulé')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Rappel annulé')));
       setState(() {});
     }
   }
@@ -632,8 +724,12 @@ class _RemindersPageState extends State<RemindersPage> {
                           'peuvent encore se déclencher selon Android.',
                     ),
                     actions: [
-                      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annuler')),
-                      FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Supprimer')),
+                      TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Annuler')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('Supprimer')),
                     ],
                   ),
                 );
