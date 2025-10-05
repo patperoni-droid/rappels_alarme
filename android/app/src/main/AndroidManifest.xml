@@ -43,7 +43,7 @@
             android:name=".AlarmReceiver"
             android:exported="true" />
 
-        <!-- Thème normal après le splash -->
+        <!-- Thème normal après le splash  ok-->
         <meta-data
             android:name="io.flutter.embedding.android.NormalTheme"
             android:resource="@style/NormalTheme"/>
